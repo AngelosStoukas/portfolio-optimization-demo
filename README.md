@@ -1,2 +1,2 @@
 # portfolio-optimization-demo
-Comparing ML models for Portfolio Optimization
+Comparing ML models and Foundation Models for Portfolio Optimization
