@@ -2,91 +2,101 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
+import yfinance as yf 
 
-#step 1: import libraries and preparing data (set seeds for reproducibility)
-
-#reproducible (αναπαραγώγιμα) τα τυχαία αποτελέσματα σε NumPy και PyTorch.
+# 1. Προετοιμασία Δεδομένων
 np.random.seed(0)
 torch.manual_seed(0)
 
-t = np.linspace(0, 100, 1000) #δημιουργεί σημεία σε ίση απόσταση μεταξύ τους.
-data = np.sin(t) #δημιουργει ημιτονοειδες τιμες
+# Επιλογή 5 μετοχών για το πείραμα
+tickers = ['AAPL', 'TSLA', 'GOOGL', 'AMZN', 'MSFT']
+data = yf.download(tickers, start="2020-01-01", end="2023-12-31")
+
+# Έλεγχος αν υπάρχει το 'Adj Close', αλλιώς χρησιμοποίησε το 'Close'
+if 'Adj Close' in data.columns:
+    df = data['Adj Close']
+else:
+    df = data['Close']
+
+# Μετατροπή σε Log-Returns 
+returns = np.log(df / df.shift(1)).dropna().values
 
 def create_sequences(data, seq_length):
     xs, ys = [], []
     for i in range(len(data)-seq_length):
         x = data[i:(i+seq_length)]
-        y = data[i+seq_length]
+        y = data[i+seq_length] 
         xs.append(x)
         ys.append(y)
     return np.array(xs), np.array(ys)
 
-seq_length = 10
-X, y = create_sequences(data, seq_length)
+seq_length = 30
+X, y = create_sequences(returns, seq_length)
 
-trainX = torch.tensor(X[:, :, None], dtype=torch.float32)
-trainY = torch.tensor(y[:, None], dtype=torch.float32)
-    
-#step 2: define the LSTM model
-class LSTMModel(nn.Module):
+# Διαστάσεις: (Samples, Seq_Length, N_Assets)
+trainX = torch.tensor(X, dtype=torch.float32)
+trainY = torch.tensor(y, dtype=torch.float32)
+
+# 2. Ορισμός του PortfolioNet (LSTM + Softmax)
+class PortfolioNet(nn.Module):
     def __init__(self, input_dim, hidden_dim, layer_dim, output_dim):
-        super(LSTMModel, self).__init__()
+        super(PortfolioNet, self).__init__()
         self.hidden_dim = hidden_dim
         self.layer_dim = layer_dim
         self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim, batch_first=True)
         self.fc = nn.Linear(hidden_dim, output_dim)
+        self.softmax = nn.Softmax(dim=1) # Διασφαλίζει sum(weights) = 1
 
-    def forward(self, x, h0=None, c0=None):
-        if h0 is None or c0 is None:
-            h0 = torch.zeros(self.layer_dim, x.size(
-                0), self.hidden_dim).to(x.device)
-            c0 = torch.zeros(self.layer_dim, x.size(
-                0), self.hidden_dim).to(x.device)
+    def forward(self, x):
+        h0 = torch.zeros(self.layer_dim, x.size(0), self.hidden_dim).to(x.device)
+        c0 = torch.zeros(self.layer_dim, x.size(0), self.hidden_dim).to(x.device)
+        
+        out, _ = self.lstm(x, (h0, c0))
+        # Παίρνουμε την έξοδο του τελευταίου χρονικού βήματος
+        out = self.fc(out[:, -1, :]) 
+        weights = self.softmax(out) # Παραγωγή βαρών w
+        return weights
 
-        out, (hn, cn) = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])  # Take last time step
-        return out, hn, cn
+# 3. Ορισμός της Συνάρτησης Sharpe Loss 
+def sharpe_loss(weights, next_day_returns):
+    # weights shape: (batch, n_assets)
+    # next_day_returns shape: (batch, n_assets)
+    portfolio_return = torch.sum(weights * next_day_returns, dim=1)
     
-#step 3: initialize Model, Loss Function, and Optimizer 
-model = LSTMModel(input_dim=1, hidden_dim=100, layer_dim=1, output_dim=1)
-criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    mean_return = torch.mean(portfolio_return)
+    std_return = torch.std(portfolio_return) + 1e-6 # ε=10^-6 για ευστάθεια
+    
+    # Επιστρέφουμε το αρνητικό Sharpe Ratio για ελαχιστοποίηση
+    return -(mean_return / std_return)
 
-#step 4: train the model
+# 4. Αρχικοποίηση και Εκπαίδευση
+n_assets = len(tickers)
+model = PortfolioNet(input_dim=n_assets, hidden_dim=64, layer_dim=2, output_dim=n_assets)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
 num_epochs = 100
-h0, c0 = None, None
-
 for epoch in range(num_epochs):
     model.train()
     optimizer.zero_grad()
 
-    outputs, h0, c0 = model(trainX, h0, c0)
+    # Το μοντέλο παράγει βάρη w*
+    weights = model(trainX) 
 
-    loss = criterion(outputs, trainY)
+    # Υπολογισμός Loss βάσει Sharpe (Επίπεδο 3)
+    loss = sharpe_loss(weights, trainY) 
     loss.backward()
     optimizer.step()
 
-    h0, c0 = h0.detach(), c0.detach()
-
     if (epoch + 1) % 10 == 0:
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
+        print(f'Epoch [{epoch+1}/{num_epochs}], Negative Sharpe Loss: {loss.item():.4f}')
 
-#step 5:
+# 5. Οπτικοποίηση Κατανομής Βαρών
 model.eval()
-predicted, _, _ = model(trainX, h0, c0)
+final_weights = model(trainX[-1:].detach()) # Βάρη για την τελευταία ημέρα
+final_weights = final_weights.detach().squeeze().numpy()
 
-original = data[seq_length:]
-time_steps = np.arange(seq_length, len(data))
-
-predicted[::30] += 0.2
-predicted[::70] -= 0.2
-
-plt.figure(figsize=(12, 6))
-plt.plot(time_steps, original, label='Original Data')
-plt.plot(time_steps, predicted.detach().numpy(),
-         label='Predicted Data', linestyle='--')
-plt.title('LSTM Model Predictions vs. Original Data')
-plt.xlabel('Time Step')
-plt.ylabel('Value')
-plt.legend()
+plt.figure(figsize=(10, 5))
+plt.bar(tickers, final_weights, color='skyblue')
+plt.title('Τελική Κατανομή Βαρών Χαρτοφυλακίου (LSTM Optimizer)')
+plt.ylabel('Βάρος (w)')
 plt.show()
